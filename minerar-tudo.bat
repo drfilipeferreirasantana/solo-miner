@@ -14,8 +14,10 @@ set POOL_HOST=solo.ckpool.org
 set POOL_PORT=3333
 set LISTEN_PORT=8081
 
-REM Deixe em branco para usar (nucleos - 1). Baixe se o PC ficar lento.
-set THREADS=
+REM Numero de threads. Em branco = nucleos menos um (deixa o PC usavel).
+REM Com todos os nucleos rende cerca de 30%% mais, mas o PC fica lento.
+REM Volte a deixar em branco se for trabalhar na maquina.
+set THREADS=4
 
 REM Ponha 1 para esconder as mensagens detalhadas e ver so o painel.
 set SILENCIOSO=
