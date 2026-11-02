@@ -92,7 +92,7 @@
     </div>
     <div class="campo-gpu" id="campoGpu" style="display:none;margin-top:10px">
       <label style="display:flex;gap:8px;align-items:flex-start;cursor:pointer">
-        <input type="checkbox" id="usarGpu" style="margin-top:3px">
+        <input type="checkbox" id="usarGpu" checked style="margin-top:3px">
         <span><b>Usar tamb&eacute;m a placa de v&iacute;deo</b><br>
         <span style="font-size:12px;opacity:.75">Experimental. Antes de minerar, o
         programa confere a placa contra o c&aacute;lculo da pr&oacute;pria
@@ -1187,6 +1187,8 @@ function startMining(){
       log('GPU: procurando placa...');
       if(!(await GPU.iniciar())){
         log('GPU indisponivel (' + GPU.motivo + '). Minerando so com o processador.', 'l-warn');
+        log('Se esta pagina esta no MESMO computador que roda o minerar-tudo, ' +
+            'feche esta aba: sem a placa, ela apenas divide o processador.', 'l-warn');
         return;
       }
       log('GPU encontrada. Conferindo contra o calculo da pagina...');
@@ -1197,6 +1199,23 @@ function startMining(){
       log('GPU aprovada no autoteste. Entrando na mineracao.', 'l-ok');
       gpuAtiva = true;
       atualizarMotor();
+
+      // Com a placa trabalhando, as threads do navegador so tomariam
+      // processador do minerador nativo, que e mais eficiente. Mantemos uma
+      // para conduzir a placa e devolvemos o resto da maquina.
+      if(workers.length > 1){
+        const sobrando = workers.length - 1;
+        for(let k=1;k<workers.length;k++){
+          try{ workers[k].postMessage({type:'stop'}); workers[k].terminate(); }catch(e){}
+        }
+        workers.length = 1;
+        const campo = document.getElementById('threads');
+        if(campo) campo.value = '1';
+        log('Placa assumiu o trabalho pesado: ' + sobrando + ' thread(s) do navegador ' +
+            'encerrada(s), para nao disputar processador com o minerador do PC.', 'l-ok');
+        startJob();   // redistribui o job para a thread restante e para a placa
+      }
+
       lacoGPU();
     })();
   }
