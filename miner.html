@@ -90,6 +90,15 @@
       <label>Threads (n&uacute;cleos usados)</label>
       <input type="number" id="threads" min="1" max="16" value="4">
     </div>
+    <div class="campo-gpu" id="campoGpu" style="display:none;margin-top:10px">
+      <label style="display:flex;gap:8px;align-items:flex-start;cursor:pointer">
+        <input type="checkbox" id="usarGpu" style="margin-top:3px">
+        <span><b>Usar tamb&eacute;m a placa de v&iacute;deo</b><br>
+        <span style="font-size:12px;opacity:.75">Experimental. Antes de minerar, o
+        programa confere a placa contra o c&aacute;lculo da pr&oacute;pria
+        p&aacute;gina; se divergir, ela &eacute; desligada sozinha.</span></span>
+      </label>
+    </div>
     <div class="field">
       <label>Dificuldade a sugerir ao pool (0 = deixar o pool decidir)</label>
       <input type="text" id="sugDiff" value="0.05">
@@ -520,6 +529,237 @@ function loop(){
 
 `;
 
+/* ===================== MOTOR GPU (WebGPU) =====================
+ *
+ * Roda no Chrome ou Edge do computador, usando a placa de video. No celular
+ * so funciona se o navegador trouxer WebGPU.
+ *
+ * DUAS TRAVAS, porque este codigo nao pode ser testado sem uma GPU:
+ *
+ *   1. Autoteste na partida. O motor varre uma faixa conhecida e o resultado
+ *      e comparado, um a um, com o que o sha256d desta pagina calcula. Se
+ *      divergir em um unico nonce, a GPU e desligada e nao se usa mais.
+ *
+ *   2. A GPU apenas PROPOE. Todo candidato e reconferido pelo sha256d da
+ *      pagina - o mesmo que o bloco genesis valida - antes de ir ao pool.
+ *      Assim, nem um erro no shader consegue produzir share invalido.
+ */
+
+const SHADER_WGSL = `
+struct Params {
+  mid : array<vec4<u32>, 2>,
+  w2  : vec4<u32>,
+  cfg : vec4<u32>,
+};
+@group(0) @binding(0) var<uniform> P : Params;
+@group(0) @binding(1) var<storage, read_write> achados : array<atomic<u32>>;
+
+const K = array<u32, 64>(
+0x428a2f98u,0x71374491u,0xb5c0fbcfu,0xe9b5dba5u,0x3956c25bu,0x59f111f1u,0x923f82a4u,0xab1c5ed5u,
+0xd807aa98u,0x12835b01u,0x243185beu,0x550c7dc3u,0x72be5d74u,0x80deb1feu,0x9bdc06a7u,0xc19bf174u,
+0xe49b69c1u,0xefbe4786u,0x0fc19dc6u,0x240ca1ccu,0x2de92c6fu,0x4a7484aau,0x5cb0a9dcu,0x76f988dau,
+0x983e5152u,0xa831c66du,0xb00327c8u,0xbf597fc7u,0xc6e00bf3u,0xd5a79147u,0x06ca6351u,0x14292967u,
+0x27b70a85u,0x2e1b2138u,0x4d2c6dfcu,0x53380d13u,0x650a7354u,0x766a0abbu,0x81c2c92eu,0x92722c85u,
+0xa2bfe8a1u,0xa81a664bu,0xc24b8b70u,0xc76c51a3u,0xd192e819u,0xd6990624u,0xf40e3585u,0x106aa070u,
+0x19a4c116u,0x1e376c08u,0x2748774cu,0x34b0bcb5u,0x391c0cb3u,0x4ed8aa4au,0x5b9cca4fu,0x682e6ff3u,
+0x748f82eeu,0x78a5636fu,0x84c87814u,0x8cc70208u,0x90befffau,0xa4506cebu,0xbef9a3f7u,0xc67178f2u);
+const IV = array<u32, 8>(
+0x6a09e667u,0xbb67ae85u,0x3c6ef372u,0xa54ff53au,0x510e527fu,0x9b05688cu,0x1f83d9abu,0x5be0cd19u);
+
+fn ror(x: u32, n: u32) -> u32 { return (x >> n) | (x << (32u - n)); }
+fn bS0(x: u32) -> u32 { return ror(x,2u) ^ ror(x,13u) ^ ror(x,22u); }
+fn bS1(x: u32) -> u32 { return ror(x,6u) ^ ror(x,11u) ^ ror(x,25u); }
+fn sS0(x: u32) -> u32 { return ror(x,7u) ^ ror(x,18u) ^ (x >> 3u); }
+fn sS1(x: u32) -> u32 { return ror(x,17u) ^ ror(x,19u) ^ (x >> 10u); }
+fn bswap(x: u32) -> u32 {
+  return ((x & 0xFFu) << 24u) | ((x & 0xFF00u) << 8u) |
+         ((x >> 8u) & 0xFF00u) | ((x >> 24u) & 0xFFu);
+}
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let nonce : u32 = P.cfg.y + gid.x;
+  var w : array<u32, 16>;
+  var a : u32; var b : u32; var c : u32; var d : u32;
+  var e : u32; var f : u32; var g : u32; var h : u32;
+  var t1 : u32; var t2 : u32; var nw : u32;
+
+  w[0] = P.w2.x; w[1] = P.w2.y; w[2] = P.w2.z;
+  w[3] = bswap(nonce);
+  w[4] = 0x80000000u;
+  for (var i = 5u; i < 15u; i = i + 1u) { w[i] = 0u; }
+  w[15] = 640u;
+
+  a = P.mid[0].x; b = P.mid[0].y; c = P.mid[0].z; d = P.mid[0].w;
+  e = P.mid[1].x; f = P.mid[1].y; g = P.mid[1].z; h = P.mid[1].w;
+
+  for (var i = 0u; i < 16u; i = i + 1u) {
+    t1 = h + bS1(e) + ((e & f) ^ (~e & g)) + K[i] + w[i];
+    t2 = bS0(a) + ((a & b) ^ (a & c) ^ (b & c));
+    h = g; g = f; f = e; e = d + t1; d = c; c = b; b = a; a = t1 + t2;
+  }
+  for (var i = 16u; i < 64u; i = i + 1u) {
+    nw = sS1(w[(i - 2u) & 15u]) + w[(i - 7u) & 15u] + sS0(w[(i - 15u) & 15u]) + w[i & 15u];
+    w[i & 15u] = nw;
+    t1 = h + bS1(e) + ((e & f) ^ (~e & g)) + K[i] + nw;
+    t2 = bS0(a) + ((a & b) ^ (a & c) ^ (b & c));
+    h = g; g = f; f = e; e = d + t1; d = c; c = b; b = a; a = t1 + t2;
+  }
+
+  w[0] = P.mid[0].x + a; w[1] = P.mid[0].y + b;
+  w[2] = P.mid[0].z + c; w[3] = P.mid[0].w + d;
+  w[4] = P.mid[1].x + e; w[5] = P.mid[1].y + f;
+  w[6] = P.mid[1].z + g; w[7] = P.mid[1].w + h;
+  w[8] = 0x80000000u;
+  for (var i = 9u; i < 15u; i = i + 1u) { w[i] = 0u; }
+  w[15] = 256u;
+
+  a = IV[0]; b = IV[1]; c = IV[2]; d = IV[3];
+  e = IV[4]; f = IV[5]; g = IV[6]; h = IV[7];
+  for (var i = 0u; i < 16u; i = i + 1u) {
+    t1 = h + bS1(e) + ((e & f) ^ (~e & g)) + K[i] + w[i];
+    t2 = bS0(a) + ((a & b) ^ (a & c) ^ (b & c));
+    h = g; g = f; f = e; e = d + t1; d = c; c = b; b = a; a = t1 + t2;
+  }
+  for (var i = 16u; i < 61u; i = i + 1u) {
+    nw = sS1(w[(i - 2u) & 15u]) + w[(i - 7u) & 15u] + sS0(w[(i - 15u) & 15u]) + w[i & 15u];
+    w[i & 15u] = nw;
+    t1 = h + bS1(e) + ((e & f) ^ (~e & g)) + K[i] + nw;
+    t2 = bS0(a) + ((a & b) ^ (a & c) ^ (b & c));
+    h = g; g = f; f = e; e = d + t1; d = c; c = b; b = a; a = t1 + t2;
+  }
+
+  let ult : u32 = bswap(IV[7] + e);
+  if (ult <= P.cfg.x) {
+    let i : u32 = atomicAdd(&achados[0], 1u);
+    if (i < 31u) { atomicStore(&achados[i + 1u], nonce); }
+  }
+}
+`;
+
+// midstate do primeiro bloco de 64 bytes do cabecalho
+function midstateDe(bytes64){
+  const Kc = [
+0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2];
+  const ro = (x,n)=>((x>>>n)|(x<<(32-n)))>>>0;
+  const h = [0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,
+             0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19];
+  const w = new Uint32Array(64);
+  for(let i=0;i<16;i++)
+    w[i] = ((bytes64[i*4]<<24)|(bytes64[i*4+1]<<16)|(bytes64[i*4+2]<<8)|bytes64[i*4+3])>>>0;
+  for(let i=16;i<64;i++)
+    w[i] = (((ro(w[i-2],17)^ro(w[i-2],19)^(w[i-2]>>>10))>>>0) + w[i-7] +
+            ((ro(w[i-15],7)^ro(w[i-15],18)^(w[i-15]>>>3))>>>0) + w[i-16])>>>0;
+  let a=h[0],b=h[1],c=h[2],d=h[3],e=h[4],f=h[5],g=h[6],hh=h[7];
+  for(let i=0;i<64;i++){
+    const t1=(hh+((ro(e,6)^ro(e,11)^ro(e,25))>>>0)+(((e&f)^(~e&g))>>>0)+Kc[i]+w[i])>>>0;
+    const t2=((((ro(a,2)^ro(a,13)^ro(a,22))>>>0))+(((a&b)^(a&c)^(b&c))>>>0))>>>0;
+    hh=g;g=f;f=e;e=(d+t1)>>>0;d=c;c=b;b=a;a=(t1+t2)>>>0;
+  }
+  return [(h[0]+a)>>>0,(h[1]+b)>>>0,(h[2]+c)>>>0,(h[3]+d)>>>0,
+          (h[4]+e)>>>0,(h[5]+f)>>>0,(h[6]+g)>>>0,(h[7]+hh)>>>0];
+}
+
+const GPU = {
+  pronta:false, disp:null, pipe:null, bufU:null, bufS:null, bufL:null, grupo:null,
+  motivo:'',
+
+  async iniciar(){
+    if(!('gpu' in navigator)){ this.motivo='navegador sem WebGPU'; return false; }
+    try{
+      const ad = await navigator.gpu.requestAdapter({powerPreference:'high-performance'});
+      if(!ad){ this.motivo='nenhuma placa disponivel'; return false; }
+      this.disp = await ad.requestDevice();
+      const mod = this.disp.createShaderModule({code: SHADER_WGSL});
+      const info = await mod.getCompilationInfo?.();
+      if(info && info.messages.some(m=>m.type==='error')){
+        this.motivo = 'erro no shader: ' + info.messages.filter(m=>m.type==='error')[0].message;
+        return false;
+      }
+      this.pipe = this.disp.createComputePipeline({layout:'auto', compute:{module:mod, entryPoint:'main'}});
+      this.bufU = this.disp.createBuffer({size:64, usage:GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST});
+      this.bufS = this.disp.createBuffer({size:128, usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_SRC|GPUBufferUsage.COPY_DST});
+      this.bufL = this.disp.createBuffer({size:128, usage:GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ});
+      this.grupo = this.disp.createBindGroup({layout:this.pipe.getBindGroupLayout(0),
+        entries:[{binding:0,resource:{buffer:this.bufU}},{binding:1,resource:{buffer:this.bufS}}]});
+      return true;
+    }catch(e){ this.motivo = e.message || String(e); return false; }
+  },
+
+  // devolve os nonces que a GPU julgou candidatos
+  async varrer(mid, w2, alvo0, base, quantos){
+    const u = new Uint32Array(16);
+    u.set(mid, 0); u[8]=w2[0]; u[9]=w2[1]; u[10]=w2[2]; u[11]=0;
+    u[12]=alvo0>>>0; u[13]=base>>>0; u[14]=0; u[15]=0;
+    this.disp.queue.writeBuffer(this.bufU, 0, u);
+    this.disp.queue.writeBuffer(this.bufS, 0, new Uint32Array(32));  // zera o contador
+
+    const cod = this.disp.createCommandEncoder();
+    const pas = cod.beginComputePass();
+    pas.setPipeline(this.pipe); pas.setBindGroup(0, this.grupo);
+    pas.dispatchWorkgroups(Math.ceil(quantos/64));
+    pas.end();
+    cod.copyBufferToBuffer(this.bufS, 0, this.bufL, 0, 128);
+    this.disp.queue.submit([cod.finish()]);
+
+    await this.bufL.mapAsync(GPUMapMode.READ);
+    const r = new Uint32Array(this.bufL.getMappedRange().slice(0));
+    this.bufL.unmap();
+    const n = Math.min(r[0], 31);
+    const saida = [];
+    for(let i=0;i<n;i++) saida.push(r[i+1]>>>0);
+    return saida;
+  },
+
+  // Varre uma faixa conhecida e exige concordancia exata com o sha256d da
+  // pagina. Qualquer divergencia desliga a GPU.
+  async autoteste(){
+    const pref = new Uint8Array(76);
+    for(let i=0;i<76;i++) pref[i] = (i*37 + 11) & 0xFF;   // conteudo fixo e arbitrario
+    const mid = midstateDe(pref.subarray(0,64));
+    const w2 = [((pref[64]<<24)|(pref[65]<<16)|(pref[66]<<8)|pref[67])>>>0,
+                ((pref[68]<<24)|(pref[69]<<16)|(pref[70]<<8)|pref[71])>>>0,
+                ((pref[72]<<24)|(pref[73]<<16)|(pref[74]<<8)|pref[75])>>>0];
+    const ALVO0 = 0x00FFFFFF;        // deixa passar cerca de 1 em 256
+    const FAIXA = 8192;
+
+    // o que a propria pagina calcula, com a funcao que o bloco genesis valida
+    const esperados = [];
+    const h80 = new Uint8Array(80); h80.set(pref,0);
+    for(let n=0;n<FAIXA;n++){
+      h80[76]=n&0xFF; h80[77]=(n>>>8)&0xFF; h80[78]=(n>>>16)&0xFF; h80[79]=(n>>>24)&0xFF;
+      const d = sha256d(h80);
+      const prim = ((d[31]<<24)|(d[30]<<16)|(d[29]<<8)|d[28])>>>0;  // ordem de exibicao
+      if(prim <= ALVO0) esperados.push(n);
+    }
+
+    let daGpu;
+    try{ daGpu = await this.varrer(mid, w2, ALVO0, 0, FAIXA); }
+    catch(e){ this.motivo = 'falhou ao executar: ' + (e.message||e); return false; }
+
+    if(esperados.length > 31){   // o buffer so guarda 31; afrouxa o teste
+      this.motivo = 'autoteste mal dimensionado'; return false;
+    }
+    const a = esperados.slice().sort((x,y)=>x-y).join(',');
+    const b = daGpu.slice().sort((x,y)=>x-y).join(',');
+    if(a !== b){
+      this.motivo = `divergiu do calculo da pagina (esperados ${esperados.length}, GPU ${daGpu.length})`;
+      return false;
+    }
+    if(esperados.length === 0){ this.motivo = 'autoteste nao encontrou nada para comparar'; return false; }
+    this.pronta = true;
+    return true;
+  }
+};
+
+
 // ---------- estado ----------
 let ws = null;
 let workers = [];
@@ -812,6 +1052,20 @@ function startJob(){
       networkTarget: networkTarget, nonceStart: Math.floor(4294967295 / n) * i
     });
   }
+
+  // A GPU recebe o mesmo job, com extranonce2 proprio para nao repetir o
+  // trabalho das threads, e comeca a varredura no meio do espaco de nonces.
+  alvoShare = shareTarget;
+  alvoRede  = networkTarget;
+  if(GPU.pronta){
+    gpuEn2 = n.toString(16).padStart(extranonce2Size*2,'0');
+    gpuPref = buildHeaderPrefix(currentJob, gpuEn2);
+    gpuMid = midstateDe(gpuPref.subarray(0,64));
+    gpuW2 = [((gpuPref[64]<<24)|(gpuPref[65]<<16)|(gpuPref[66]<<8)|gpuPref[67])>>>0,
+             ((gpuPref[68]<<24)|(gpuPref[69]<<16)|(gpuPref[70]<<8)|gpuPref[71])>>>0,
+             ((gpuPref[72]<<24)|(gpuPref[73]<<16)|(gpuPref[74]<<8)|gpuPref[75])>>>0];
+    gpuCursor = 0x80000000 >>> 0;
+  }
 }
 
 let hashrateTimer = null;
@@ -853,6 +1107,67 @@ function informarTaxa(hps){
     }).catch(function(){ /* sem proxy do outro lado: segue minerando */ });
   } catch(e) { /* navegador sem fetch: idem */ }
 }
+
+/* ---- estado e laco do motor GPU ---- */
+let gpuAtiva=false, gpuPref=null, gpuMid=null, gpuW2=null, gpuCursor=0,
+    gpuEn2='', gpuLote=262144, alvoShare=null, alvoRede=null;
+
+function menorQueAlvo(hashExib, alvo){
+  for(let i=0;i<8;i++){
+    if(hashExib[i] < alvo[i]) return true;
+    if(hashExib[i] > alvo[i]) return false;
+  }
+  return true;
+}
+
+// A GPU so propoe. Aqui a propria pagina reconfere, com o sha256d que o
+// bloco genesis valida, antes de qualquer envio ao pool.
+function conferirCandidato(nonce){
+  const h80 = new Uint8Array(80);
+  h80.set(gpuPref, 0);
+  h80[76]=nonce&0xFF; h80[77]=(nonce>>>8)&0xFF;
+  h80[78]=(nonce>>>16)&0xFF; h80[79]=(nonce>>>24)&0xFF;
+  const d = sha256d(h80);
+  const exib = new Uint32Array(8);
+  for(let i=0;i<8;i++)
+    exib[i] = ((d[31-i*4]<<24)|(d[30-i*4]<<16)|(d[29-i*4]<<8)|d[28-i*4])>>>0;
+  if(!menorQueAlvo(exib, alvoShare)) return false;    // a GPU errou: descarta
+  const ehBloco = menorQueAlvo(exib, alvoRede);
+  if(ehBloco) log('Nonce de nivel BLOCO encontrado na GPU: ' + nonce + ' - enviando...', 'l-block');
+  enviarShare(gpuEn2, nonce, ehBloco);
+  return true;
+}
+
+async function lacoGPU(){
+  let propostos=0, aceitos=0;
+  while(gpuAtiva && GPU.pronta){
+    if(!gpuPref || !alvoShare){ await new Promise(r=>setTimeout(r,200)); continue; }
+    const t0 = performance.now();
+    let cands;
+    try{
+      cands = await GPU.varrer(gpuMid, gpuW2, alvoShare[0], gpuCursor, gpuLote);
+    }catch(e){
+      log('GPU falhou durante a mineracao: ' + (e.message||e) + ' - desligando', 'l-err');
+      gpuAtiva=false; GPU.pronta=false; atualizarMotor(); return;
+    }
+    hashAccum += gpuLote;
+    gpuCursor = (gpuCursor + gpuLote) >>> 0;
+    for(const n of cands){ propostos++; if(conferirCandidato(n>>>0)) aceitos++; }
+    // Se a GPU propoe muito e a pagina recusa tudo, algo esta errado nela.
+    if(propostos >= 40 && aceitos === 0){
+      log('GPU propos ' + propostos + ' candidatos e nenhum passou na conferencia. Desligando a GPU.', 'l-err');
+      gpuAtiva=false; GPU.pronta=false; atualizarMotor(); return;
+    }
+    const dt = performance.now() - t0;
+    if(dt > 0) gpuLote = Math.max(65536, Math.min(16777216, Math.round(gpuLote*(250/dt)))) & ~63;
+  }
+}
+
+function atualizarMotor(){
+  const base = enginePill.textContent.replace(/ \+ GPU.*$/,'');
+  enginePill.textContent = base + (gpuAtiva && GPU.pronta ? ' + GPU' : '');
+}
+
 let blobUrl = null;
 
 function startMining(){
@@ -864,6 +1179,27 @@ function startMining(){
 
   const blob = new Blob([workerSrc], {type:'application/javascript'});
   blobUrl = URL.createObjectURL(blob);
+
+  // A GPU entra como frente ADICIONAL, ao lado das threads. Se qualquer
+  // etapa falhar, a mineracao segue so com o processador.
+  if(document.getElementById('usarGpu') && document.getElementById('usarGpu').checked){
+    (async function(){
+      log('GPU: procurando placa...');
+      if(!(await GPU.iniciar())){
+        log('GPU indisponivel (' + GPU.motivo + '). Minerando so com o processador.', 'l-warn');
+        return;
+      }
+      log('GPU encontrada. Conferindo contra o calculo da pagina...');
+      if(!(await GPU.autoteste())){
+        log('GPU REPROVADA no autoteste: ' + GPU.motivo + '. Nao sera usada.', 'l-err');
+        return;
+      }
+      log('GPU aprovada no autoteste. Entrando na mineracao.', 'l-ok');
+      gpuAtiva = true;
+      atualizarMotor();
+      lacoGPU();
+    })();
+  }
 
   for(let i=0;i<n;i++){
     const w = new Worker(blobUrl);
@@ -905,7 +1241,7 @@ function startMining(){
   }, 1000);
 }
 
-function submitShare(workerIdx, nonce, isBlock){
+function enviarShare(extranonce2, nonce, isBlock){
   if(!currentJob || !window.__stratumSend) return;
   const id = msgId++;
   pendingSubmissions[id] = { isBlock: !!isBlock };
@@ -915,15 +1251,21 @@ function submitShare(workerIdx, nonce, isBlock){
     params: [
       document.getElementById('btcUser').value.trim(),
       currentJob.jobId,
-      workers[workerIdx]._extranonce2,
+      extranonce2,
       currentJob.ntime,
       (nonce >>> 0).toString(16).padStart(8,'0')
     ]
   });
 }
 
+function submitShare(workerIdx, nonce, isBlock){
+  enviarShare(workers[workerIdx]._extranonce2, nonce, isBlock);
+}
+
 function stopMining(){
   running = false;
+  gpuAtiva = false;
+  gpuPref = null;
   for(let i=0;i<workers.length;i++){
     try{ workers[i].postMessage({type:'stop'}); workers[i].terminate(); }catch(e){}
   }
@@ -955,6 +1297,11 @@ stopBtn.addEventListener('click', function(){
   stopMining();
   setStatus('desconectado');
 });
+
+if('gpu' in navigator){
+  const c = document.getElementById('campoGpu');
+  if(c) c.style.display = '';
+}
 
 fetchNetworkInfo();
 setInterval(fetchNetworkInfo, 5*60*1000);
