@@ -23,6 +23,7 @@
 const { spawn } = require('child_process');
 const os = require('os');
 const path = require('path');
+
 const fs = require('fs');
 
 const POOL_HOST   = process.env.POOL_HOST || 'solo.ckpool.org';
@@ -123,10 +124,25 @@ if (listaIps.length) {
   console.log('  Nenhum IP de rede encontrado - confira a conexao Wi-Fi.');
 }
 console.log('-'.repeat(64));
+// O IP da rede local muda com frequencia. O nome da maquina, nao: o Windows
+// responde por ele via mDNS, e o iPhone resolve nomes .local nativamente.
+// Quando funciona, acaba a busca pelo IP a cada sessao.
+const nomeMaquina = (os.hostname() || '').split('.')[0];
+
 console.log('  No celular, abra no navegador:');
 console.log('     http://' + ipSugerido + ':' + LISTEN_PORT + '/');
-console.log('  No campo "proxy" da pagina:');
+if (nomeMaquina) {
+  console.log('');
+  console.log('  OU, melhor, este endereco NAO muda quando o IP muda:');
+  console.log('     http://' + nomeMaquina.toLowerCase() + '.local:' + LISTEN_PORT + '/');
+  console.log('     (se abrir, use sempre este e esqueca o IP)');
+}
+console.log('');
+console.log('  No campo "proxy" da pagina, o mesmo endereco com ws:// e /ws:');
 console.log('     ws://' + ipSugerido + ':' + LISTEN_PORT + '/ws');
+if (nomeMaquina) {
+  console.log('     ws://' + nomeMaquina.toLowerCase() + '.local:' + LISTEN_PORT + '/ws');
+}
 console.log('  No campo do endereco, use:');
 console.log('     ' + USER_CEL);
 console.log('  Pode repetir em QUANTOS celulares quiser - o painel soma todos.');
