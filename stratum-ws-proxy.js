@@ -153,7 +153,9 @@ const server = http.createServer((req, res) => {
           log('taxa dos celulares: ' + Math.round(s.soma) + ' H/s (' +
               s.quantos + (s.quantos === 1 ? ' aparelho' : ' aparelhos') + ')');
         }
-      } catch (e) { /* corpo invalido: ignora, nao derruba nada */ }
+      } catch (e) {
+        log('POST /taxa com corpo invalido (' + corpo.length + ' bytes)');
+      }
       res.writeHead(204); res.end();
     });
     return;
@@ -162,11 +164,21 @@ const server = http.createServer((req, res) => {
   if (req.url === '/' || req.url === '/index.html' || req.url === '/miner.html') {
     fs.readFile(MINER_HTML_PATH, (err, data) => {
       if (err) { res.writeHead(500); res.end('miner.html nao encontrado ao lado deste script.'); return; }
-      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.writeHead(200, {
+        'Content-Type': 'text/html; charset=utf-8',
+        // sem cache: o celular ficava com a pagina antiga mesmo apos recarregar
+        'Cache-Control': 'no-store, no-cache, must-revalidate',
+        'Pragma': 'no-cache',
+        'Expires': '0'
+      });
       res.end(data);
+      log('entreguei miner.html (' + data.length + ' bytes) para ' +
+          (req.socket.remoteAddress || '?'));
     });
     return;
   }
+  log('requisicao inesperada: ' + req.method + ' ' + req.url + ' de ' +
+      (req.socket.remoteAddress || '?'));
   res.writeHead(404); res.end('not found');
 });
 
